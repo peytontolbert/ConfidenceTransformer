@@ -7,6 +7,8 @@ from datasets import load_dataset
 from main import ConfidenceEnhancedTransformer
 
 num_epochs = 3
+save_steps = 500  # Save the model every 500 steps
+
 # Define a custom dataset
 class TextDataset(Dataset):
     def __init__(self, tokenizer, texts, block_size=128):
@@ -57,8 +59,8 @@ device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
 model.to(device)
 
 # Training loop
-num_epochs = 3
 model.train()
+global_step = 0
 for epoch in range(num_epochs):
     print(f"Epoch {epoch + 1}/{num_epochs}")
     epoch_loss = 0
@@ -79,10 +81,16 @@ for epoch in range(num_epochs):
         scheduler.step()
 
         epoch_loss += loss.item()
+        global_step += 1
+
+        # Save the model every 500 steps
+        if global_step % save_steps == 0:
+            model.save_pretrained(f'model_step_{global_step}.pth')
+            tokenizer.save_pretrained(f'tokenizer_step_{global_step}.pth')
 
     avg_loss = epoch_loss / len(train_dataloader)
     print(f"Average loss: {avg_loss:.4f}")
 
-# Save the trained model
-model.save_pretrained('path_to_save_your_model')
-tokenizer.save_pretrained('path_to_save_your_model')
+# Save the final trained model
+model.save_pretrained('confidence_model')
+tokenizer.save_pretrained('confidence_model')
