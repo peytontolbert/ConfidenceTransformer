@@ -23,7 +23,6 @@ class ConfidenceEnhancedTransformer(GPT2LMHeadModel):
 
     def forward(self, input_ids, attention_mask=None, labels=None, num_dropout_samples=10):
         # Standard forward pass through transformer
-        # Forward pass through GPT2LMHeadModel
         outputs = super().forward(
             input_ids=input_ids,
             attention_mask=attention_mask,
@@ -35,9 +34,6 @@ class ConfidenceEnhancedTransformer(GPT2LMHeadModel):
         lm_logits = outputs.logits  # [batch_size, sequence_length, vocab_size]
         hidden_states = outputs.hidden_states[-1]  # Get the last hidden state
         attentions = outputs.attentions  # Attention weights
-
-        # Language modeling logits
-        #lm_logits = self.lm_head(hidden_states)
 
         # Base confidence score from hidden states
         base_confidence_score = self.confidence_head(hidden_states.mean(dim=1))
@@ -57,23 +53,24 @@ class ConfidenceEnhancedTransformer(GPT2LMHeadModel):
             original_mode = self.training  # Save original mode
             self.train()  # Enable dropout layers
             for _ in range(num_dropout_samples):
-                with torch.no_grad():
-                    dropout_outputs = super().forward(
-                        input_ids=input_ids,
-                        attention_mask=attention_mask,
-                        output_hidden_states=True,
-                        return_dict=True,
-                    )
-                    dropout_hidden_states = dropout_outputs.hidden_states[-1]
-                    dropout_confidence = self.confidence_head(dropout_hidden_states.mean(dim=1))
-                    dropout_scores.append(dropout_confidence)
-
+                # Removed torch.no_grad() to ensure dropout behaves correctly
+                dropout_outputs = super().forward(
+                    input_ids=input_ids,
+                    attention_mask=attention_mask,
+                    output_hidden_states=True,
+                    return_dict=True,
+                )
+                dropout_hidden_states = dropout_outputs.hidden_states[-1]
+                dropout_confidence = self.confidence_head(dropout_hidden_states.mean(dim=1))
+                dropout_scores.append(dropout_confidence)
+            
             self.train(original_mode)  # Restore original mode
             # Calculate variance of dropout predictions as a confidence measure
-            dropout_scores = torch.stack(dropout_scores)
+            dropout_scores = torch.stack(dropout_scores)  # [num_samples, batch_size, 1]
             variance_confidence = torch.var(dropout_scores, dim=0).mean()
         else:
-            variance_confidence = torch.tensor(0.0)
+            variance_confidence = torch.tensor(0.0).to(hidden_states.device)
+
         # OOD detection score
         ood_score = torch.sigmoid(self.ood_detector(hidden_states.mean(dim=1))).squeeze()
 
@@ -105,14 +102,17 @@ class ConfidenceEnhancedTransformer(GPT2LMHeadModel):
             # OOD loss
             ood_loss = nn.BCELoss()(ood_score, torch.zeros_like(ood_score))  # Penalty for high OOD score
 
-            # Combine all losses
-            total_loss = lm_loss + 0.1 * confidence_loss + 0.1 * ood_loss
+            # Combine all losses with adjusted weights
+            total_loss = lm_loss + 0.5 * confidence_loss + 0.3 * ood_loss  # Increased weights
 
         return {
             'loss': total_loss,
             'lm_logits': lm_logits,
             'confidence_score': refined_confidence_score,  # Refined confidence score
-            'ood_score': ood_score  # Out-of-distribution score
+            'ood_score': ood_score,  # Out-of-distribution score
+            'base_confidence_score': base_confidence_score.squeeze(),  # Added for logging
+            'variance_confidence': variance_confidence,  # Added for logging
+            'avg_attention_entropy': avg_attention_entropy  # Added for logging
         }
 
 # Example usage of the model
