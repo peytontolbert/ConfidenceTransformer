@@ -30,8 +30,8 @@ The Confidence Enhanced Transformer extends the GPT-2 model to include mechanism
 
 1. Clone the repository:
     ```sh
-    git clone https://github.com/yourusername/confidence-enhanced-transformer.git
-    cd confidence-enhanced-transformer
+    git clone https://github.com/peytontolbert/confidencetransformer.git
+    cd confidencetransformer
     ```
 
 2. Create a virtual environment and activate it:
