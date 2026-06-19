@@ -1,3 +1,6 @@
 model_step_7500.pth/
 tokenizer_step_7500.pth/
 confidence_model/
+__pycache__/
+*.py[cod]
+.pytest_cache/

@@ -1,79 +1,90 @@
+import argparse
+from typing import Optional
+
 import torch
-import torch.nn as nn
-import torch.nn.functional as F
-from transformers import GPT2Tokenizer, GPT2LMHeadModel, GPT2Model
 from datasets import load_dataset
-from main import ConfidenceEnhancedTransformer  # Import the class from main.py
+from transformers import GPT2Tokenizer
 
-# Load the trained model and tokenizer
-model_name = 'confidence_model'
-model_path = model_name
-tokenizer_path = model_name
-tokenizer = GPT2Tokenizer.from_pretrained(tokenizer_path)
+from main import ConfidenceEnhancedTransformer
 
-model = ConfidenceEnhancedTransformer.from_pretrained(model_path, attn_implementation="eager")
 
-# Move model to GPU if available
-device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
-model.to(device)
+def load_wikitext_example(index: int = 3) -> str:
+    dataset = load_dataset("wikitext", "wikitext-2-raw-v1", split="train")
+    for text in dataset["text"][index:]:
+        text = text.strip()
+        if text:
+            return text
+    raise ValueError("Could not find a non-empty WikiText example.")
 
-# Set the model to evaluation mode
-model.eval()
 
-# Load the WikiText-2 dataset
-dataset = load_dataset('wikitext', 'wikitext-2-raw-v1', split='train')
+def score_text(
+    model: ConfidenceEnhancedTransformer,
+    tokenizer: GPT2Tokenizer,
+    text: str,
+    device: torch.device,
+    num_dropout_samples: int,
+) -> None:
+    inputs = tokenizer(text, return_tensors="pt").to(device)
+    if inputs.input_ids.size(1) == 0:
+        raise ValueError("Input text produced an empty input_ids tensor.")
 
-# Ensure the example text is not empty and preprocess it
-example_text = dataset['text'][3].strip()  # Get the first example from the dataset and strip whitespace
-if not example_text:
-    raise ValueError("The example text from the dataset is empty. Please check the dataset.")
+    with torch.no_grad():
+        outputs = model(
+            input_ids=inputs.input_ids,
+            attention_mask=inputs.get("attention_mask"),
+            num_dropout_samples=num_dropout_samples,
+        )
 
-# Example usage
+    generated_text = tokenizer.decode(outputs["lm_logits"].argmax(-1).squeeze().tolist())
+    print(f"Input: {text}")
+    print(f"Refined Confidence Score: {outputs['confidence_score'].item():.4f}")
+    print(f"OOD Score: {outputs['ood_score'].item():.4f}")
+    print(f"Greedy Token Decode: {generated_text}")
+    print()
+
+
+def parse_args() -> argparse.Namespace:
+    parser = argparse.ArgumentParser(description="Evaluate ConfidenceEnhancedTransformer.")
+    parser.add_argument("--model-path", default="confidence_model")
+    parser.add_argument("--tokenizer-path", default=None)
+    parser.add_argument("--prompt", default="tefewafwef aoasdfsfasdfsadfdfasdsdijfoiwej")
+    parser.add_argument("--num-dropout-samples", type=int, default=10)
+    parser.add_argument("--skip-wikitext", action="store_true")
+    return parser.parse_args()
+
+
+def main() -> None:
+    args = parse_args()
+    tokenizer_path: Optional[str] = args.tokenizer_path or args.model_path
+    tokenizer = GPT2Tokenizer.from_pretrained(tokenizer_path)
+    model = ConfidenceEnhancedTransformer.from_pretrained(
+        args.model_path,
+        attn_implementation="eager",
+    )
+
+    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+    model.to(device)
+    model.eval()
+
+    print("OOD-style prompt")
+    score_text(
+        model=model,
+        tokenizer=tokenizer,
+        text=args.prompt,
+        device=device,
+        num_dropout_samples=args.num_dropout_samples,
+    )
+
+    if not args.skip_wikitext:
+        print("WikiText example")
+        score_text(
+            model=model,
+            tokenizer=tokenizer,
+            text=load_wikitext_example(),
+            device=device,
+            num_dropout_samples=args.num_dropout_samples,
+        )
+
+
 if __name__ == "__main__":
-    prompt = "tefewafwef aoasdfsfasdfsadfdfasdsdijfoiwej"
-    inputs = tokenizer(prompt, return_tensors='pt').to(device)
-    
-    # Check if input_ids is empty
-    if inputs.input_ids.size(1) == 0:
-        raise ValueError("The input text resulted in an empty input_ids tensor. Please check the input text.")
-    
-    with torch.no_grad():
-        outputs = model(
-            input_ids=inputs.input_ids,
-            attention_mask=inputs.attention_mask,
-            num_dropout_samples=10  # Increased from 5 to 10
-        )
-    # Get the confidence score
-    confidence_score = outputs['confidence_score'].item()
-    ood_score = outputs['ood_score'].item()
-    print(f"Refined Confidence Score: {confidence_score}")
-    print(f"OOD Score: {ood_score}")
-
-    # Decode and print the generated text (not part of the confidence mechanism)
-    generated_text = tokenizer.decode(outputs['lm_logits'].argmax(-1).squeeze().tolist())
-    print(f"OOD example: {prompt}")
-    print(f"Generated Text: {generated_text}")
-
-    # Evaluate on an in-distribution example from WikiText-2
-    inputs = tokenizer(example_text, return_tensors='pt').to(device)
-    
-    # Check if input_ids is empty
-    if inputs.input_ids.size(1) == 0:
-        raise ValueError("The example text resulted in an empty input_ids tensor. Please check the example text.")
-    
-    with torch.no_grad():
-        outputs = model(
-            input_ids=inputs.input_ids,
-            attention_mask=inputs.attention_mask,
-            num_dropout_samples=10
-        )
-    # Get the confidence score for the in-distribution example
-    confidence_score = outputs['confidence_score'].item()
-    ood_score = outputs['ood_score'].item()
-    print(f"In-Distribution Example - Refined Confidence Score: {confidence_score}")
-    print(f"In-Distribution Example - OOD Score: {ood_score}")
-
-    # Decode and print the generated text for the in-distribution example
-    generated_text = tokenizer.decode(outputs['lm_logits'].argmax(-1).squeeze().tolist())
-    print(f"example text: {example_text}")
-    print(f"In-Distribution Example - Generated Text: {generated_text}")
+    main()

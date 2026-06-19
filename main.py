@@ -1,135 +1,253 @@
+import math
+from dataclasses import dataclass
+from typing import Optional
+
 import torch
 import torch.nn as nn
-from transformers import GPT2LMHeadModel, GPT2Model, GPT2Tokenizer
 import torch.nn.functional as F
+from transformers import GPT2LMHeadModel, GPT2Tokenizer
+from transformers.utils import ModelOutput
+
+
+@dataclass
+class ConfidenceModelOutput(ModelOutput):
+    loss: Optional[torch.Tensor] = None
+    logits: Optional[torch.Tensor] = None
+    lm_logits: Optional[torch.Tensor] = None
+    past_key_values: Optional[tuple] = None
+    hidden_states: Optional[tuple] = None
+    attentions: Optional[tuple] = None
+    lm_loss: Optional[torch.Tensor] = None
+    confidence_loss: Optional[torch.Tensor] = None
+    ood_loss: Optional[torch.Tensor] = None
+    confidence_score: Optional[torch.Tensor] = None
+    ood_score: Optional[torch.Tensor] = None
+    base_confidence_score: Optional[torch.Tensor] = None
+    variance_confidence: Optional[torch.Tensor] = None
+    avg_attention_entropy: Optional[torch.Tensor] = None
+
 
 class ConfidenceEnhancedTransformer(GPT2LMHeadModel):
-    def __init__(self, config):
-        super(ConfidenceEnhancedTransformer, self).__init__(config)
-        self.transformer = GPT2Model(config)
-        #self.lm_head = nn.Linear(config.n_embd, config.vocab_size, bias=False)  # Language modeling head
+    """GPT-2 language model with confidence and OOD scoring heads."""
 
-        # Confidence scoring head for epistemic uncertainty and OOD detection
+    def __init__(self, config):
+        super().__init__(config)
+
         self.confidence_head = nn.Sequential(
             nn.Linear(config.n_embd, 128),
             nn.ReLU(),
-            nn.Linear(128, 1),  # Single output for confidence score
-            nn.Sigmoid()  # Confidence score between 0 and 1
+            nn.Linear(128, 1),
+            nn.Sigmoid(),
         )
-        
-        # OOD detector head
-        self.ood_detector = nn.Linear(config.n_embd, 1)  # Auxiliary head for OOD detection
-        self.init_weights()
+        self.ood_detector = nn.Linear(config.n_embd, 1)
 
-    def forward(self, input_ids, attention_mask=None, labels=None, num_dropout_samples=10):
-        # Standard forward pass through transformer
+        self.confidence_head.apply(self._init_weights)
+        self.ood_detector.apply(self._init_weights)
+
+    @staticmethod
+    def _masked_mean(
+        hidden_states: torch.Tensor,
+        attention_mask: Optional[torch.Tensor]
+    ) -> torch.Tensor:
+        if attention_mask is None:
+            return hidden_states.mean(dim=1)
+
+        mask = attention_mask.to(device=hidden_states.device, dtype=hidden_states.dtype)
+        mask = mask.unsqueeze(-1)
+        return (hidden_states * mask).sum(dim=1) / mask.sum(dim=1).clamp_min(1.0)
+
+    @staticmethod
+    def _normalized_attention_entropy(
+        attentions,
+        batch_size: int,
+        device: torch.device,
+    ) -> torch.Tensor:
+        if not attentions:
+            return torch.zeros(batch_size, device=device)
+
+        layer_entropies = []
+        for attention in attentions:
+            attention_probs = attention.mean(dim=1)
+            entropy = -torch.sum(
+                attention_probs * torch.log(attention_probs.clamp_min(1e-12)),
+                dim=-1,
+            )
+            denom = math.log(max(attention_probs.size(-1), 2))
+            layer_entropies.append((entropy / denom).mean(dim=-1))
+
+        return torch.stack(layer_entropies, dim=0).mean(dim=0).clamp(0.0, 1.0)
+
+    def _mc_dropout_confidence_variance(
+        self,
+        input_ids: torch.Tensor,
+        attention_mask: Optional[torch.Tensor],
+        num_dropout_samples: int,
+        reference_confidence: torch.Tensor,
+    ) -> torch.Tensor:
+        if num_dropout_samples <= 1:
+            return torch.zeros_like(reference_confidence)
+
+        original_mode = self.training
+        dropout_scores = []
+
+        try:
+            self.train()
+            with torch.no_grad():
+                for _ in range(num_dropout_samples):
+                    outputs = super().forward(
+                        input_ids=input_ids,
+                        attention_mask=attention_mask,
+                        output_hidden_states=True,
+                        return_dict=True,
+                    )
+                    pooled_hidden = self._masked_mean(
+                        outputs.hidden_states[-1],
+                        attention_mask,
+                    )
+                    dropout_scores.append(self.confidence_head(pooled_hidden))
+        finally:
+            self.train(original_mode)
+
+        scores = torch.stack(dropout_scores, dim=0)
+        return torch.var(scores, dim=0, unbiased=False)
+
+    def _confidence_target_from_logits(
+        self,
+        shift_logits: torch.Tensor,
+        shift_labels: torch.Tensor,
+    ) -> torch.Tensor:
+        probs = F.softmax(shift_logits.detach(), dim=-1)
+        entropy = -torch.sum(probs * torch.log(probs.clamp_min(1e-12)), dim=-1)
+        normalized_entropy = entropy / math.log(shift_logits.size(-1))
+        token_confidence = (1.0 - normalized_entropy).clamp(0.0, 1.0)
+
+        valid = shift_labels.ne(-100)
+        token_confidence = token_confidence * valid.to(token_confidence.dtype)
+        return token_confidence.sum(dim=-1) / valid.sum(dim=-1).clamp_min(1)
+
+    def forward(
+        self,
+        input_ids: torch.Tensor,
+        attention_mask: Optional[torch.Tensor] = None,
+        labels: Optional[torch.Tensor] = None,
+        ood_labels: Optional[torch.Tensor] = None,
+        num_dropout_samples: int = 1,
+        **kwargs,
+    ) -> ConfidenceModelOutput:
+        kwargs.pop("output_attentions", None)
+        kwargs.pop("output_hidden_states", None)
+        kwargs.pop("return_dict", None)
+
         outputs = super().forward(
             input_ids=input_ids,
             attention_mask=attention_mask,
-            labels=labels,
             output_attentions=True,
             output_hidden_states=True,
             return_dict=True,
+            **kwargs,
         )
-        lm_logits = outputs.logits  # [batch_size, sequence_length, vocab_size]
-        hidden_states = outputs.hidden_states[-1]  # Get the last hidden state
-        attentions = outputs.attentions  # Attention weights
 
-        # Base confidence score from hidden states
-        base_confidence_score = self.confidence_head(hidden_states.mean(dim=1))
+        lm_logits = outputs.logits
+        hidden_states = outputs.hidden_states[-1]
+        pooled_hidden = self._masked_mean(hidden_states, attention_mask)
 
-        # Attention-based confidence signal
-        attention_entropy = []
-        for attn_layer in attentions:
-            attn_probs = attn_layer.mean(dim=1)  # Mean over heads
-            attn_entropy = -torch.sum(attn_probs * torch.log(attn_probs + 1e-12), dim=-1)
-            attention_entropy.append(attn_entropy.mean(dim=-1))  # Mean over tokens
-        avg_attention_entropy = torch.stack(attention_entropy).mean(dim=0)  # Mean over layers
+        base_confidence_score = self.confidence_head(pooled_hidden)
+        variance_confidence = self._mc_dropout_confidence_variance(
+            input_ids=input_ids,
+            attention_mask=attention_mask,
+            num_dropout_samples=num_dropout_samples,
+            reference_confidence=base_confidence_score,
+        )
+        variance_penalty = (variance_confidence / 0.25).clamp(0.0, 1.0)
 
-        # Monte Carlo Dropout for variance estimation
-        variance_confidence = 0.0
-        dropout_scores = []
-        if num_dropout_samples > 1:
-            original_mode = self.training  # Save original mode
-            self.train()  # Enable dropout layers
-            for _ in range(num_dropout_samples):
-                # Removed torch.no_grad() to ensure dropout behaves correctly
-                dropout_outputs = super().forward(
-                    input_ids=input_ids,
-                    attention_mask=attention_mask,
-                    output_hidden_states=True,
-                    return_dict=True,
-                )
-                dropout_hidden_states = dropout_outputs.hidden_states[-1]
-                dropout_confidence = self.confidence_head(dropout_hidden_states.mean(dim=1))
-                dropout_scores.append(dropout_confidence)
-            
-            self.train(original_mode)  # Restore original mode
-            # Calculate variance of dropout predictions as a confidence measure
-            dropout_scores = torch.stack(dropout_scores)  # [num_samples, batch_size, 1]
-            variance_confidence = torch.var(dropout_scores, dim=0).mean()
-        else:
-            variance_confidence = torch.tensor(0.0).to(hidden_states.device)
+        avg_attention_entropy = self._normalized_attention_entropy(
+            outputs.attentions,
+            batch_size=input_ids.size(0),
+            device=input_ids.device,
+        )
+        ood_score = torch.sigmoid(self.ood_detector(pooled_hidden)).squeeze(-1)
 
-        # OOD detection score
-        ood_score = torch.sigmoid(self.ood_detector(hidden_states.mean(dim=1))).squeeze()
+        refined_confidence_score = torch.stack(
+            [
+                base_confidence_score.squeeze(-1),
+                1.0 - variance_penalty.squeeze(-1),
+                1.0 - avg_attention_entropy,
+                1.0 - ood_score,
+            ],
+            dim=-1,
+        ).mean(dim=-1, keepdim=True)
 
-        # Adjust this line to handle ood_score shape correctly
-        if len(ood_score.shape) == 0:
-            ood_score = ood_score.unsqueeze(0)  # Add batch dimension if it's a scalar
-
-        # Combine all signals into a refined confidence score
-        refined_confidence_score = (
-            base_confidence_score 
-            - variance_confidence  # Lower confidence if high variance
-            - avg_attention_entropy.unsqueeze(1)  # Lower confidence if high attention entropy
-            - ood_score.unsqueeze(1)  # Lower confidence if high OOD score
-        ).clamp(0, 1)  # Ensure the final score is between 0 and 1
-
-        # Calculate total loss if labels are provided
         total_loss = None
+        lm_loss = None
+        confidence_loss = None
+        ood_loss = None
+
         if labels is not None:
-            # Language modeling loss
             shift_logits = lm_logits[..., :-1, :].contiguous()
             shift_labels = labels[..., 1:].contiguous()
-            lm_loss = nn.CrossEntropyLoss()(shift_logits.view(-1, shift_logits.size(-1)), shift_labels.view(-1))
+            lm_loss = F.cross_entropy(
+                shift_logits.view(-1, shift_logits.size(-1)),
+                shift_labels.view(-1),
+                ignore_index=-100,
+            )
 
-            # Entropy-based confidence loss
-            token_probs = F.softmax(shift_logits, dim=-1)
-            entropy = -torch.sum(token_probs * torch.log(token_probs + 1e-12), dim=-1).mean(dim=-1)
-            confidence_loss = nn.MSELoss()(base_confidence_score.squeeze(), 1 - entropy)
+            confidence_target = self._confidence_target_from_logits(
+                shift_logits,
+                shift_labels,
+            )
+            confidence_loss = F.mse_loss(
+                base_confidence_score.squeeze(-1),
+                confidence_target,
+            )
 
-            # OOD loss
-            ood_loss = nn.BCELoss()(ood_score, torch.zeros_like(ood_score))  # Penalty for high OOD score
+            if ood_labels is not None:
+                ood_targets = ood_labels.to(device=ood_score.device, dtype=ood_score.dtype)
+                ood_loss = F.binary_cross_entropy(ood_score, ood_targets)
+            else:
+                ood_loss = ood_score.sum() * 0.0
 
-            # Combine all losses with adjusted weights
-            total_loss = lm_loss + 0.5 * confidence_loss + 0.3 * ood_loss  # Increased weights
+            total_loss = lm_loss + 0.5 * confidence_loss + 0.3 * ood_loss
 
-        return {
-            'loss': total_loss,
-            'lm_logits': lm_logits,
-            'confidence_score': refined_confidence_score,  # Refined confidence score
-            'ood_score': ood_score,  # Out-of-distribution score
-            'base_confidence_score': base_confidence_score.squeeze(),  # Added for logging
-            'variance_confidence': variance_confidence,  # Added for logging
-            'avg_attention_entropy': avg_attention_entropy  # Added for logging
-        }
+        return ConfidenceModelOutput(
+            loss=total_loss,
+            logits=lm_logits,
+            lm_logits=lm_logits,
+            past_key_values=getattr(outputs, "past_key_values", None),
+            hidden_states=outputs.hidden_states,
+            attentions=outputs.attentions,
+            lm_loss=lm_loss,
+            confidence_loss=confidence_loss,
+            ood_loss=ood_loss,
+            confidence_score=refined_confidence_score,
+            ood_score=ood_score,
+            base_confidence_score=base_confidence_score.squeeze(-1),
+            variance_confidence=variance_confidence.squeeze(-1),
+            avg_attention_entropy=avg_attention_entropy,
+        )
 
-# Example usage of the model
-tokenizer = GPT2Tokenizer.from_pretrained('gpt2')
-model = ConfidenceEnhancedTransformer.from_pretrained('gpt2', attn_implementation='eager')
 
-# Example input
-input_text = "What is the capital of USA?"
-input_tokens = tokenizer(input_text, return_tensors="pt")
-outputs = model(input_tokens['input_ids'], num_dropout_samples=10)
+def run_demo() -> None:
+    tokenizer = GPT2Tokenizer.from_pretrained("gpt2")
+    model = ConfidenceEnhancedTransformer.from_pretrained(
+        "gpt2",
+        attn_implementation="eager",
+    )
+    model.eval()
 
-# Get the confidence score
-confidence_score = outputs['confidence_score'].item()
-ood_score = outputs['ood_score'].item()
-print(f"Refined Confidence Score: {confidence_score}")
-print(f"OOD Score: {ood_score}")
+    input_text = "What is the capital of the USA?"
+    input_tokens = tokenizer(input_text, return_tensors="pt")
 
-# Decode and print the generated text (not part of the confidence mechanism)
-generated_text = tokenizer.decode(outputs['lm_logits'].argmax(-1).squeeze().tolist())
-print(f"Generated Text: {generated_text}")
+    with torch.no_grad():
+        outputs = model(input_tokens["input_ids"], num_dropout_samples=10)
+
+    confidence_score = outputs["confidence_score"].item()
+    ood_score = outputs["ood_score"].item()
+    generated_text = tokenizer.decode(outputs["lm_logits"].argmax(-1).squeeze().tolist())
+
+    print(f"Refined Confidence Score: {confidence_score:.4f}")
+    print(f"OOD Score: {ood_score:.4f}")
+    print(f"Generated Text: {generated_text}")
+
+
+if __name__ == "__main__":
+    run_demo()

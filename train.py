@@ -1,214 +1,238 @@
-import torch
-from torch.utils.data import Dataset, DataLoader
-from transformers import GPT2Tokenizer, get_linear_schedule_with_warmup
-from tqdm import tqdm
-import torch.optim as optim
-from datasets import load_dataset
-from main import ConfidenceEnhancedTransformer
-from sklearn.model_selection import train_test_split
-from sklearn.metrics import accuracy_score
-import numpy as np
+import argparse
+from pathlib import Path
+from typing import Iterable, Tuple
+
 import matplotlib.pyplot as plt
+import numpy as np
+import torch
+from datasets import load_dataset
+from sklearn.model_selection import train_test_split
+from torch.utils.data import DataLoader, Dataset
+from tqdm import tqdm
+from transformers import GPT2Tokenizer, get_linear_schedule_with_warmup
 
-num_epochs = 3
-save_steps = 500  # Save the model every 500 steps
+from main import ConfidenceEnhancedTransformer
 
-# Define a custom dataset
+
 class TextDataset(Dataset):
-    def __init__(self, tokenizer, texts, block_size=128):
+    def __init__(self, tokenizer: GPT2Tokenizer, texts: Iterable[str], block_size: int = 128):
         self.examples = []
 
         for text in texts:
+            if not text.strip():
+                continue
             tokenized_text = tokenizer.encode(text)
             for i in range(0, len(tokenized_text) - block_size + 1, block_size):
                 self.examples.append(
                     torch.tensor(tokenized_text[i:i + block_size], dtype=torch.long)
                 )
 
-    def __len__(self):
+    def __len__(self) -> int:
         return len(self.examples)
 
-    def __getitem__(self, i):
-        return self.examples[i]
+    def __getitem__(self, index: int) -> torch.Tensor:
+        return self.examples[index]
 
-# Load tokenizer and model
-tokenizer = GPT2Tokenizer.from_pretrained('gpt2')
-model = ConfidenceEnhancedTransformer.from_pretrained('gpt2')
 
-# Load the WikiText-2 dataset
-dataset = load_dataset('wikitext', 'wikitext-2-raw-v1', split='train')
-texts = dataset['text']
+def compute_sequence_accuracy(logits: torch.Tensor, labels: torch.Tensor) -> np.ndarray:
+    shift_logits = logits[..., :-1, :]
+    shift_labels = labels[..., 1:]
+    predictions = shift_logits.argmax(dim=-1)
+    valid = shift_labels.ne(-100)
+    correct = predictions.eq(shift_labels) & valid
+    accuracy = correct.sum(dim=-1).float() / valid.sum(dim=-1).clamp_min(1)
+    return accuracy.detach().cpu().numpy()
 
-# Split the dataset into training and validation sets
-train_texts, val_texts = train_test_split(texts, test_size=0.1, random_state=42)
 
-# Prepare datasets
-train_dataset = TextDataset(
-    tokenizer=tokenizer,
-    texts=train_texts,
-    block_size=128
-)
-val_dataset = TextDataset(
-    tokenizer=tokenizer,
-    texts=val_texts,
-    block_size=128
-)
-
-# Create DataLoaders
-train_dataloader = DataLoader(train_dataset, batch_size=4, shuffle=True)
-val_dataloader = DataLoader(val_dataset, batch_size=4, shuffle=False)
-
-# Prepare optimizer and scheduler
-optimizer = optim.AdamW(model.parameters(), lr=5e-5)
-total_steps = len(train_dataloader) * num_epochs
-scheduler = get_linear_schedule_with_warmup(
-    optimizer,
-    num_warmup_steps=0,
-    num_training_steps=total_steps
-)
-
-# Move model to GPU if available
-device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
-model.to(device)
-
-# Define ECE computation function
-def compute_ece(preds, confidences, n_bins=10):
-    bin_boundaries = np.linspace(0, 1, n_bins + 1)
+def compute_ece(accuracies: np.ndarray, confidences: np.ndarray, n_bins: int = 10) -> float:
+    bin_boundaries = np.linspace(0.0, 1.0, n_bins + 1)
     ece = 0.0
+
     for i in range(n_bins):
         bin_lower = bin_boundaries[i]
         bin_upper = bin_boundaries[i + 1]
         in_bin = (confidences > bin_lower) & (confidences <= bin_upper)
         prop_in_bin = np.mean(in_bin)
         if prop_in_bin > 0:
-            accuracy_in_bin = np.mean(preds[in_bin] == preds[in_bin])  # Adjust based on your prediction mechanism
-            avg_confidence_in_bin = np.mean(confidences[in_bin])
-            ece += np.abs(avg_confidence_in_bin - accuracy_in_bin) * prop_in_bin
-    return ece
+            avg_accuracy = np.mean(accuracies[in_bin])
+            avg_confidence = np.mean(confidences[in_bin])
+            ece += np.abs(avg_confidence - avg_accuracy) * prop_in_bin
 
-# Define Reliability Diagram function
-def reliability_diagram(confidences, predictions, n_bins=10):
-    bin_boundaries = np.linspace(0, 1, n_bins + 1)
+    return float(ece)
+
+
+def reliability_diagram(
+    accuracies: np.ndarray,
+    confidences: np.ndarray,
+    save_path: Path,
+    n_bins: int = 10,
+) -> None:
+    bin_boundaries = np.linspace(0.0, 1.0, n_bins + 1)
     bin_centers = (bin_boundaries[:-1] + bin_boundaries[1:]) / 2
-    accuracy = np.zeros(n_bins)
-    confidence = np.zeros(n_bins)
-    prop = np.zeros(n_bins)
+    binned_accuracy = np.zeros(n_bins)
+    binned_confidence = np.zeros(n_bins)
 
     for i in range(n_bins):
         in_bin = (confidences > bin_boundaries[i]) & (confidences <= bin_boundaries[i + 1])
-        prop[i] = np.mean(in_bin)
-        if prop[i] > 0:
-            accuracy[i] = np.mean(predictions[in_bin] == predictions[in_bin])  # Replace with actual labels
-            confidence[i] = np.mean(confidences[in_bin])
+        if np.any(in_bin):
+            binned_accuracy[i] = np.mean(accuracies[in_bin])
+            binned_confidence[i] = np.mean(confidences[in_bin])
 
     plt.figure(figsize=(8, 6))
-    plt.plot(bin_centers, accuracy, marker='o', label='Accuracy')
-    plt.plot(bin_centers, confidence, marker='s', label='Confidence')
-    plt.fill_between(bin_boundaries[:-1], 0, 1, color='gray', alpha=0.1)
-    plt.xlabel('Confidence')
-    plt.ylabel('Accuracy')
+    plt.plot([0, 1], [0, 1], linestyle="--", color="black", label="Perfect calibration")
+    plt.plot(bin_centers, binned_accuracy, marker="o", label="Accuracy")
+    plt.plot(bin_centers, binned_confidence, marker="s", label="Confidence")
+    plt.xlabel("Confidence")
+    plt.ylabel("Accuracy")
     plt.legend()
-    plt.title('Reliability Diagram')
-    plt.show()
+    plt.title("Reliability Diagram")
+    plt.tight_layout()
+    plt.savefig(save_path)
+    plt.close()
 
-# Training loop
-model.train()
-global_step = 0
-for epoch in range(num_epochs):
-    print(f"Epoch {epoch + 1}/{num_epochs}")
-    epoch_loss = 0
-    for batch in tqdm(train_dataloader):
-        inputs = batch.to(device)
-        labels = inputs.clone()
 
-        optimizer.zero_grad()
+def build_dataloaders(
+    tokenizer: GPT2Tokenizer,
+    block_size: int,
+    batch_size: int,
+) -> Tuple[DataLoader, DataLoader]:
+    dataset = load_dataset("wikitext", "wikitext-2-raw-v1", split="train")
+    texts = dataset["text"]
+    train_texts, val_texts = train_test_split(texts, test_size=0.1, random_state=42)
 
-        outputs = model(
-            input_ids=inputs,
-            labels=labels,
-            num_dropout_samples=15  # You can adjust this number
-        )
-        loss = outputs['loss']
-        loss.backward()
+    train_dataset = TextDataset(tokenizer, train_texts, block_size=block_size)
+    val_dataset = TextDataset(tokenizer, val_texts, block_size=block_size)
 
-        # Check gradients for confidence_head and ood_detector
-        for name, param in model.named_parameters():
-            if 'confidence_head' in name or 'ood_detector' in name:
-                if param.grad is not None:
-                    print(f"Gradient for {name}: {param.grad.mean().item()}")
+    if len(train_dataset) == 0 or len(val_dataset) == 0:
+        raise ValueError("Dataset preparation produced no training or validation examples.")
 
-        optimizer.step()
-        scheduler.step()
+    return (
+        DataLoader(train_dataset, batch_size=batch_size, shuffle=True),
+        DataLoader(val_dataset, batch_size=batch_size, shuffle=False),
+    )
 
-        epoch_loss += loss.item()
-        global_step += 1
 
-        # Log intermediate values for debugging
-        base_confidence_score = outputs['base_confidence_score'].mean().item()
-        variance_confidence = outputs['variance_confidence'].item()
-        avg_attention_entropy = outputs['avg_attention_entropy'].mean().item()
-        ood_score = outputs['ood_score'].mean().item()
+def parse_args() -> argparse.Namespace:
+    parser = argparse.ArgumentParser(description="Train ConfidenceEnhancedTransformer.")
+    parser.add_argument("--model-name", default="gpt2")
+    parser.add_argument("--output-dir", default="confidence_model")
+    parser.add_argument("--epochs", type=int, default=3)
+    parser.add_argument("--batch-size", type=int, default=4)
+    parser.add_argument("--block-size", type=int, default=128)
+    parser.add_argument("--learning-rate", type=float, default=5e-5)
+    parser.add_argument("--num-dropout-samples", type=int, default=5)
+    parser.add_argument("--save-steps", type=int, default=500)
+    return parser.parse_args()
 
-        print(f"Step {global_step}: Loss = {loss.item():.4f}, "
-              f"Base Confidence Score = {base_confidence_score:.4f}, "
-              f"Variance Confidence = {variance_confidence:.4f}, "
-              f"Avg Attention Entropy = {avg_attention_entropy:.4f}, "
-              f"OOD Score = {ood_score:.4f}")
 
-        # Save the model every 500 steps
-        if global_step % save_steps == 0:
-            model.save_pretrained(f'model_step_{global_step}.pth')
-            tokenizer.save_pretrained(f'tokenizer_step_{global_step}.pth')
+def main() -> None:
+    args = parse_args()
+    output_dir = Path(args.output_dir)
+    output_dir.mkdir(parents=True, exist_ok=True)
 
-    avg_train_loss = epoch_loss / len(train_dataloader)
-    print(f"Average Training Loss: {avg_train_loss:.4f}")
+    tokenizer = GPT2Tokenizer.from_pretrained(args.model_name)
+    model = ConfidenceEnhancedTransformer.from_pretrained(
+        args.model_name,
+        attn_implementation="eager",
+    )
 
-    # Validation phase
-    model.eval()
-    val_loss = 0
-    all_val_preds = []
-    all_val_confidences = []
-    with torch.no_grad():
-        for val_batch in tqdm(val_dataloader, desc="Validation"):
-            val_inputs = val_batch.to(device)
-            val_labels = val_inputs.clone()
+    train_dataloader, val_dataloader = build_dataloaders(
+        tokenizer,
+        block_size=args.block_size,
+        batch_size=args.batch_size,
+    )
 
-            val_outputs = model(
-                input_ids=val_inputs,
-                labels=val_labels,
-                num_dropout_samples=15
+    optimizer = torch.optim.AdamW(model.parameters(), lr=args.learning_rate)
+    total_steps = len(train_dataloader) * args.epochs
+    scheduler = get_linear_schedule_with_warmup(
+        optimizer,
+        num_warmup_steps=0,
+        num_training_steps=total_steps,
+    )
+
+    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+    model.to(device)
+
+    global_step = 0
+    for epoch in range(args.epochs):
+        model.train()
+        epoch_loss = 0.0
+        print(f"Epoch {epoch + 1}/{args.epochs}")
+
+        for batch in tqdm(train_dataloader, desc="Training"):
+            inputs = batch.to(device)
+            labels = inputs.clone()
+
+            optimizer.zero_grad(set_to_none=True)
+            outputs = model(
+                input_ids=inputs,
+                labels=labels,
+                num_dropout_samples=args.num_dropout_samples,
             )
-            val_loss += val_outputs['loss'].item()
+            loss = outputs["loss"]
+            loss.backward()
+            optimizer.step()
+            scheduler.step()
 
-            # Collect predictions and confidence scores for calibration
-            val_confidences = val_outputs['base_confidence_score'].cpu().numpy()
-            # Assuming you're using the model's logits to derive predictions
-            val_logits = val_outputs['logits']
-            val_preds = torch.argmax(val_logits, dim=-1).cpu().numpy()
-            all_val_preds.extend(val_preds.flatten())
-            all_val_confidences.extend(val_confidences.flatten())
+            epoch_loss += loss.item()
+            global_step += 1
 
-    avg_val_loss = val_loss / len(val_dataloader)
-    print(f"Average Validation Loss after Epoch {epoch + 1}: {avg_val_loss:.4f}")
+            if global_step % 50 == 0:
+                print(
+                    f"Step {global_step}: loss={loss.item():.4f}, "
+                    f"base_conf={outputs['base_confidence_score'].mean().item():.4f}, "
+                    f"ood={outputs['ood_score'].mean().item():.4f}"
+                )
 
-    # Calculate ECE
-    ece = compute_ece(
-        preds=np.array(all_val_preds),
-        confidences=np.array(all_val_confidences),
-        n_bins=10
-    )
-    print(f"Expected Calibration Error (ECE) after Epoch {epoch + 1}: {ece:.4f}")
+            if args.save_steps > 0 and global_step % args.save_steps == 0:
+                checkpoint_dir = output_dir / f"step_{global_step}"
+                model.save_pretrained(checkpoint_dir)
+                tokenizer.save_pretrained(checkpoint_dir)
 
-    # Plot Reliability Diagram
-    reliability_diagram(
-        confidences=np.array(all_val_confidences),
-        predictions=np.array(all_val_preds),
-        n_bins=10
-    )
+        avg_train_loss = epoch_loss / len(train_dataloader)
+        print(f"Average Training Loss: {avg_train_loss:.4f}")
 
-    # Reset model to training mode
-    model.train()
+        model.eval()
+        val_loss = 0.0
+        all_accuracies = []
+        all_confidences = []
 
-# Save the final trained model
-model.save_pretrained('confidence_model')
-tokenizer.save_pretrained('confidence_model')
+        with torch.no_grad():
+            for val_batch in tqdm(val_dataloader, desc="Validation"):
+                val_inputs = val_batch.to(device)
+                val_labels = val_inputs.clone()
+                val_outputs = model(
+                    input_ids=val_inputs,
+                    labels=val_labels,
+                    num_dropout_samples=args.num_dropout_samples,
+                )
+                val_loss += val_outputs["loss"].item()
+
+                batch_accuracies = compute_sequence_accuracy(
+                    val_outputs["lm_logits"],
+                    val_labels,
+                )
+                batch_confidences = val_outputs["confidence_score"].squeeze(-1).cpu().numpy()
+                all_accuracies.extend(batch_accuracies.tolist())
+                all_confidences.extend(batch_confidences.tolist())
+
+        all_accuracies = np.array(all_accuracies)
+        all_confidences = np.array(all_confidences)
+        avg_val_loss = val_loss / len(val_dataloader)
+        ece = compute_ece(all_accuracies, all_confidences, n_bins=10)
+
+        print(f"Average Validation Loss after Epoch {epoch + 1}: {avg_val_loss:.4f}")
+        print(f"Expected Calibration Error after Epoch {epoch + 1}: {ece:.4f}")
+        reliability_diagram(
+            accuracies=all_accuracies,
+            confidences=all_confidences,
+            save_path=output_dir / f"reliability_epoch_{epoch + 1}.png",
+            n_bins=10,
+        )
+
+    model.save_pretrained(output_dir)
+    tokenizer.save_pretrained(output_dir)
+
+
+if __name__ == "__main__":
+    main()
